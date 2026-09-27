@@ -1,0 +1,13 @@
+# Temporary manifest cache and indices
+*.manifest
+*.json
+
+# Logs and backups
+*.log
+Old_Files_Backup/
+Patch_Staging/
+
+# OS files
+Thumbs.db
+Desktop.ini
+.DS_Store
