@@ -68,11 +68,12 @@ function Run-DownloadStream {
         [string]$ManifestFile,
         [string]$TargetDir,
         [string]$FilterArgs,
-        [int]$TotalCount
+        [int64]$TotalExpectedBytes = 0
     )
 
     $adapter = (Get-NetAdapter | Where-Object { $_.Status -eq 'Up' } | Select-Object -First 1).Name
-    $lastBytes = (Get-NetAdapterStatistics -Name $adapter -ErrorAction SilentlyContinue).ReceivedBytes
+    $startBytes = (Get-NetAdapterStatistics -Name $adapter -ErrorAction SilentlyContinue).ReceivedBytes
+    $lastBytes = $startBytes
     $lastTime = [DateTime]::UtcNow
     $speedMB = 0.0
 
@@ -85,35 +86,45 @@ function Run-DownloadStream {
     $psi.CreateNoWindow = $true
 
     $proc = [System.Diagnostics.Process]::Start($psi)
-    $processed = 0
+    $currentFile = "Connecting to CDN..."
 
     try {
-        while (-not $proc.StandardOutput.EndOfStream) {
-            $line = $proc.StandardOutput.ReadLine()
-            if (-not $line) { continue }
+        while (-not $proc.HasExited) {
+            Start-Sleep -Milliseconds 250
+
+            # Drain stdout without blocking so the loop never freezes
+            while ($proc.StandardOutput.Peek() -ge 0) {
+                $line = $proc.StandardOutput.ReadLine()
+                if ($line -match "(Downloading file|Fixing up file|Verifying file)\s+(.+?)(\.\.\.|$)") {
+                    $currentFile = $matches[2]
+                }
+            }
 
             $now = [DateTime]::UtcNow
             $diff = ($now - $lastTime).TotalSeconds
-            if ($diff -ge 1.0) {
-                $currBytes = (Get-NetAdapterStatistics -Name $adapter -ErrorAction SilentlyContinue).ReceivedBytes
-                if ($currBytes -and $lastBytes) {
-                    $speedMB = [math]::Round((($currBytes - $lastBytes) / $diff) / 1MB, 1)
-                }
-                $lastBytes = $currBytes
+            $currNetBytes = (Get-NetAdapterStatistics -Name $adapter -ErrorAction SilentlyContinue).ReceivedBytes
+
+            if ($diff -ge 0.5 -and $currNetBytes -gt $lastBytes) {
+                $speedMB = [math]::Round((($currNetBytes - $lastBytes) / $diff) / 1MB, 1)
+                $lastBytes = $currNetBytes
                 $lastTime = $now
             }
 
-            if ($line -match "Downloading file\s+(.+?)(\.\.\.|$)" -or $line -match "(File\s+(.+?)\s+is\s+correct)") {
-                $f = if ($matches[1] -match "correct") { $matches[2] } else { $matches[1] }
-                if ($line -match "Downloading") {
-                    $processed++
-                    $denom = if ($TotalCount -gt 0) { $TotalCount } else { 218 }
-                    $pct = [math]::Min(100, [math]::Max(1, [math]::Round(($processed / $denom) * 100)))
+            $downBytes = [math]::Max(0, $currNetBytes - $startBytes)
+            if ($TotalExpectedBytes -gt 0) {
+                $pct = [math]::Min(99, [math]::Max(1, [math]::Round(($downBytes / $TotalExpectedBytes) * 100)))
+                $mbDown = [math]::Round($downBytes / 1MB, 1)
+                $mbTot = [math]::Round($TotalExpectedBytes / 1MB, 1)
+                $status = "$pct% | $speedMB MB/s ($mbDown / $mbTot MB)"
 
-                    Write-Progress -Activity $Title -Status "$pct% | Speed: $speedMB MB/s ($processed/$denom files)" -PercentComplete $pct -CurrentOperation $f
-                    $disp = if ($f.Length -gt 40) { "..." + $f.Substring($f.Length - 37) } else { $f }
-                    Write-Host ("`r[Downloading] [{0,5} MB/s] [{1,3}%] ({2,2}/{3}) {4,-40}" -f $speedMB, $pct, $processed, $denom, $disp) -NoNewline
-                }
+                Write-Progress -Activity $Title -Status $status -PercentComplete $pct -CurrentOperation $currentFile
+                $disp = if ($currentFile.Length -gt 38) { "..." + $currentFile.Substring($currentFile.Length - 35) } else { $currentFile }
+                Write-Host ("`r[Downloading] [{0,5} MB/s] [{1,3}%] ({2,6}/{3} MB) {4,-38}" -f $speedMB, $pct, $mbDown, $mbTot, $disp) -NoNewline
+            } else {
+                $mbDown = [math]::Round($downBytes / 1MB, 1)
+                Write-Progress -Activity $Title -Status "$speedMB MB/s ($mbDown MB downloaded)" -PercentComplete 50 -CurrentOperation $currentFile
+                $disp = if ($currentFile.Length -gt 45) { "..." + $currentFile.Substring($currentFile.Length - 42) } else { $currentFile }
+                Write-Host ("`r[Downloading] [{0,5} MB/s] ({1,6} MB) {2,-45}" -f $speedMB, $mbDown, $disp) -NoNewline
             }
         }
         $proc.WaitForExit()
@@ -175,6 +186,14 @@ while ($true) {
                 break
             }
 
+            # Close Riot Client if running to release file locks
+            $riotProcs = Get-Process -Name *RiotClient*, *LeagueClient* -ErrorAction SilentlyContinue
+            if ($riotProcs) {
+                Write-Host ">>> Closing Riot Client to release file locks..." -ForegroundColor Yellow
+                $riotProcs | Stop-Process -Force -ErrorAction SilentlyContinue
+                Start-Sleep -Milliseconds 500
+            }
+
             Write-Host ">>> Found $count outdated files ($([math]::Round($totalBytes / 1MB, 1)) MB). Clearing old versions..." -ForegroundColor Yellow
             if (-not (Test-Path $backupDir)) { New-Item -ItemType Directory -Path $backupDir -Force | Out-Null }
             foreach ($rel in $diffList) {
@@ -184,8 +203,12 @@ while ($true) {
                 }
             }
 
+            # Build targeted filter so ManifestDownloader touches ONLY these specific files
+            $escapedNames = $diffList | ForEach-Object { [regex]::Escape([System.IO.Path]::GetFileName($_)) }
+            $filterRegex = "(" + ($escapedNames -join "|") + ")$"
+
             Write-Host ">>> Streaming updated files directly from CDN..." -ForegroundColor Cyan
-            Run-DownloadStream -Title "Patching League $($info.Version)" -ManifestFile $files.Manifest -TargetDir $gameDir -FilterArgs "--skip-existing" -TotalCount $count
+            Run-DownloadStream -Title "Patching League $($info.Version)" -ManifestFile $files.Manifest -TargetDir $gameDir -FilterArgs "-f `"$filterRegex`"" -TotalExpectedBytes $totalBytes
 
             if (Test-Path $backupDir) { Remove-Item -Recurse -Force $backupDir -ErrorAction SilentlyContinue }
             Write-Host ">>> Patch $($info.Version) successfully applied! Launch Riot Client to play." -ForegroundColor Green
@@ -207,8 +230,16 @@ while ($true) {
             $info = Get-LatestManifestInfo -region $config.Region
             $files = Ensure-ManifestDownloaded -info $info
 
+            # Calculate total expected size for clean install
+            $mFull = Get-Content $files.Json -Raw | ConvertFrom-Json
+            $fullBytes = [int64]0
+            foreach ($f in $mFull.files) {
+                if ($f.languages.Count -gt 0 -and ($f.languages -notcontains 10)) { continue }
+                $fullBytes += [int64]($f.file_size -replace '[^\d]')
+            }
+
             Write-Host ">>> Downloading full clean game client ($($info.Version)) with $($config.Threads) threads..." -ForegroundColor Cyan
-            Run-DownloadStream -Title "Full LoL Download ($($info.Version))" -ManifestFile $files.Manifest -TargetDir $gameDir -FilterArgs "--skip-existing" -TotalCount 218
+            Run-DownloadStream -Title "Full LoL Download ($($info.Version))" -ManifestFile $files.Manifest -TargetDir $gameDir -FilterArgs "--skip-existing" -TotalExpectedBytes $fullBytes
 
             Write-Host ">>> Full game downloaded! Open Riot Client -> 'Already installed? Locate game' -> select folder." -ForegroundColor Green
             pause
